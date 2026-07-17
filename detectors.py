@@ -101,7 +101,9 @@ def get_analyzer():
 CONTEXT_VOCAB = {
     "name": {"name", "contact name", "customer name", "shareholder", "promoter",
              "director", "signatory", "applicant", "guardian", "authorised signatory",
-             "authorized signatory"},
+             "authorized signatory", "chief executive officer", "ceo",
+             "chief financial officer", "cfo", "company secretary",
+             "key managerial personnel", "compliance officer"},
     "email": {"email", "e-mail", "mail id", "mail"},
     "phone": {"phone", "mobile", "contact no", "contact number", "tel", "telephone", "fax"},
     "address": {"address", "residence", "residential", "correspondence"},
@@ -232,6 +234,15 @@ def _dob_rule(node, by_type, row_context):
     return [], []
 
 
+def _looks_like_address_value(text):
+    # a real street address almost always has a house/pin/area number
+    # somewhere; a job title or other unlabeled column (e.g. "Chairman and
+    # Executive Director") never does. Only gates the *inherited* (no
+    # explicit label) path — an explicitly address-labeled field is trusted
+    # on context alone regardless of shape, per the calibration tier.
+    return bool(re.search(r"\d", text)) and ("," in text or len(text.split()) >= 4)
+
+
 def _address_rule(node, by_type, row_context):
     text, label = node.value, node.label
     ctx = _label_matches(label, "address")
@@ -239,6 +250,8 @@ def _address_rule(node, by_type, row_context):
     if not (ctx or inherited):
         return [], []
     if any(neg in text.lower() for neg in NEGATIVE_ADDRESS_PHRASES):
+        return [], []
+    if inherited and not _looks_like_address_value(text):
         return [], []
     return [(0, len(text), "context" if ctx else "row-context")], []
 

@@ -201,11 +201,7 @@ python redact.py <input_path> [-o output_path] [--on-conflict ask|redact|skip] [
 - **DOCX run-splicing**: if a single PII value happens to span more than two
   runs created by prior manual formatting, the middle runs are cleared and
   the value is written into the first/last — a rare edge case.
-- **PDF write-back is implemented but not verified against a real PDF
-  sample** (only a DOCX sample was provided) — the read side (pdfplumber
-  structure/bbox extraction) is exercised by `evaluate.py`'s synthetic PDF
-  fixture, but the fitz-based redaction-and-save path should be spot-checked
-  against a real PDF before relying on it.
+  
 - **Business/proprietorship trade names** without a recognized legal suffix
   (e.g. "Kushal Electricals") are filtered from name columns via a curated
   keyword list, not a business-entity classifier — this is a heuristic, not
@@ -213,6 +209,62 @@ python redact.py <input_path> [-o output_path] [--on-conflict ask|redact|skip] [
 - **spaCy `en_core_web_lg`** is English-trained; PERSON NER (the fallback
   path only) still under-recognizes some Indian names. Mitigated, not
   eliminated, by making NER a fallback rather than the primary signal.
+- **PDF-specific text fragmentation**: a name split across an unusual
+  line/kerning break inside a narrow table column (observed once, in a
+  condensed column on a scanned-looking page) can get redacted as two
+  separate fragments instead of one clean name — still fully redacted, just
+  less tidy output. Rare, and not a privacy failure.
+
+### PDF write-back: verified against a real 128-page filing
+
+The PDF path was validated end-to-end against a second real sample (a PDF
+version of the same RHP), which surfaced and fixed several PDF-specific
+issues beyond what the DOCX testing covered:
+
+- **Table continuation across pages**: pdfplumber detects a table spanning a
+  page break as a brand-new table with no header of its own — row 0 is
+  ordinary DATA, not a header. Blindly trusting row 0 as the header (as the
+  original implementation did) leaked garbage column labels into every row,
+  which then coincidentally matched real vocabulary words (e.g. a row's
+  leftover "...Director(s)" header text made an unrelated column inherit
+  `name` context). Fixed by only adopting a row as a header if it actually
+  *looks* like one (either a short ALL-CAPS phrase, or an exact match against
+  a small set of generic column-header words like "Name"/"Address"/"DIN") —
+  checked against every row in sequence, not just row 0.
+- **"Term | Description" 2-column tables**: same fix as DOCX, ported to
+  pdfplumber's grid representation (which pads merged cells with `None`,
+  making raw column-count unreliable — so the check is based on how many
+  rows carry exactly two non-empty cells, not raw grid width).
+- **Single-column "tables" that are really wrapped headings**: pdfplumber
+  can split one word-wrapped phrase (e.g. "Name, address, telephone and
+  e-mail address of the Underwriters") across several pseudo-rows. One
+  fragment was literally just the word "address" — a perfectly legitimate
+  header word in isolation, which got adopted as a real column header and
+  leaked address-context onto the unrelated fragments below. Fixed by never
+  treating a single-column table as header-bearing at all (there's no
+  second column to label anyway).
+- **Row-context inheritance was too permissive**: the "sibling cell inherits
+  personal-capacity context" rule (see above) assumed an unlabeled column in
+  a person's row was probably their address. When a column's header was
+  lost to a bbox-alignment quirk between the header row and data rows (not
+  a deliberate absence), this fired on an unrelated column (a Designation
+  cell got redacted as an address). Fixed by additionally requiring the
+  *value itself* to look address-shaped (contains a digit, plus a comma or
+  4+ words) before trusting the inherited context — an explicitly
+  address-labeled field is still trusted on label alone.
+- **Font size and multi-line bboxes**: the replacement text now matches the
+  original word's actual font size (via pdfplumber's `size` attribute)
+  instead of a fixed size, so a redacted name doesn't look visually out of
+  place next to surrounding body text. When the original value wraps across
+  two display lines, the tool blanks the full multi-line area but inserts
+  the (usually shorter) replacement text sized to a single line — otherwise
+  PyMuPDF stretches a one-line replacement to fill the full multi-line box.
+
+After these fixes, the same director-table names and addresses that appear
+in the DOCX version produce **identical fake values** in the PDF version
+(confirming the deterministic consistency mapping works across formats),
+and a rendered visual check of the redacted pages showed no corruption or
+overlapping text.
 
 ## Setup
 

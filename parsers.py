@@ -349,6 +349,18 @@ def write_docx(root, doc, output_path):
 # PDF
 # ---------------------------------------------------------------------------
 
+# generic column-header words (Title Case in most real tables, e.g. a real
+# "Name | Designation | DIN | Address" director table) — used as a whole-cell
+# match so an actual value never qualifies just for being short/Title-Case
+_GENERIC_HEADER_WORDS = {
+    "name", "address", "designation", "din", "description", "term", "type",
+    "date", "amount", "particulars", "details", "no", "number", "sr",
+    "category", "nature", "remarks", "age", "qualification", "experience",
+    "email", "e-mail", "phone", "telephone", "mobile", "pan", "aadhaar",
+    "signature", "website", "contact", "person", "office",
+}
+
+
 def _cluster_lines(words, tol=3):
     """Group words sharing similar 'top' into lines, left-to-right."""
     lines = []
@@ -407,7 +419,7 @@ def parse_pdf(path):
                 cy = (word["top"] + word["bottom"]) / 2
                 return any(bx0 <= cx <= bx1 and by0 <= cy <= by1 for (bx0, by0, bx1, by1) in table_bboxes)
 
-            words = page.extract_words()
+            words = page.extract_words(extra_attrs=["size"])
             loose_words = [w for w in words if not in_any_table(w)]
             lines = _cluster_lines(loose_words)
 
@@ -435,28 +447,101 @@ def parse_pdf(path):
                 t_node = Node(next_id(), "pdf", "table", None, f"page[{pi}].table[{ti}]", None)
                 page_node.children.append(t_node)
                 grid = table.extract()
-                header = [(c or "").strip() for c in grid[0]] if grid else []
-                for ri, row in enumerate(table.rows):
-                    if ri == 0:
-                        continue
-                    row_node = Node(next_id(), "pdf", "table_row", None,
-                                     f"page[{pi}].table[{ti}].row[{ri}]", None)
-                    t_node.children.append(row_node)
-                    for ci, cell_bbox in enumerate(row.cells):
+                if not grid:
+                    continue
+
+                # Extract each cell's text/word-offsets once via bbox word-
+                # matching. pdfplumber pads merged cells with None and (unlike
+                # python-docx) has no notion of "this table continues from a
+                # previous page" — a table that's really a continuation often
+                # has ordinary DATA in row 0, not a header, which would
+                # otherwise leak nonsense column labels into every row below.
+                cell_data = []  # cell_data[ri] = [(text, offsets, bbox) | None, ...]
+                for row in table.rows:
+                    row_cells = []
+                    for cell_bbox in row.cells:
                         if cell_bbox is None:
+                            row_cells.append(None)
                             continue
                         cx0, cy0, cx1, cy1 = cell_bbox
                         cell_words = [w for w in words if cx0 <= (w["x0"] + w["x1"]) / 2 <= cx1
                                       and cy0 <= (w["top"] + w["bottom"]) / 2 <= cy1]
                         text, offsets = _line_text_and_word_offsets(cell_words)
-                        if not text.strip():
+                        text = text.strip()
+                        row_cells.append((text, offsets, cell_bbox) if text else None)
+                    cell_data.append(row_cells)
+
+                # A single-column "table" is almost always a fragmented
+                # heading/paragraph, not real tabular data — pdfplumber can
+                # split one wrapped phrase (e.g. "Name, address, telephone
+                # and e-mail address of the Underwriters") across several
+                # pseudo-rows, one of which may just be the lone word
+                # "address". That word is a perfectly legitimate header word
+                # in isolation, so without this guard it gets adopted as a
+                # real column header and leaks "address" context onto
+                # unrelated fragments in the rows below.
+                n_cols = max((len(row_cells) for row_cells in cell_data), default=0)
+                single_col = n_cols <= 1
+
+                populated_counts = [sum(1 for c in row_cells if c) for row_cells in cell_data]
+                populated_counts = [c for c in populated_counts if c > 0]
+                # "Term | Description" style tables: most populated rows carry
+                # exactly two non-empty cells, regardless of raw grid width
+                # (None-padding from merges makes raw column count unreliable)
+                two_col = not single_col and bool(populated_counts) and (
+                    sum(1 for c in populated_counts if c == 2) / len(populated_counts) >= 0.6
+                )
+
+                def _looks_like_header_row(row_cells):
+                    texts = [c[0] for c in row_cells if c]
+                    if not texts:
+                        return False
+
+                    def _header_ish(t):
+                        # Two independent signals: an ALL-CAPS short phrase
+                        # (front-matter cover-page labels like "REGISTERED
+                        # OFFICE"), or the cell being *exactly* one of a
+                        # handful of generic column-header words — this is
+                        # deliberately a whole-cell match, not "contains", so
+                        # an actual value like "Kushal Subbayya Hegde" never
+                        # qualifies just because it's short and Title-Case.
+                        words_ = t.split()
+                        if not (0 < len(words_) <= 6):
+                            return False
+                        if t == t.upper() and any(ch.isalpha() for ch in t):
+                            return True
+                        core = re.sub(r"\s+", " ", t).strip().lower().rstrip(".,;:")
+                        return core in _GENERIC_HEADER_WORDS
+
+                    return sum(1 for t in texts if _header_ish(t)) >= max(1, len(texts) // 2)
+
+                header = None
+                for ri, row_cells in enumerate(cell_data):
+                    if not any(row_cells):
+                        continue
+
+                    if two_col:
+                        populated = [(ci, c) for ci, c in enumerate(row_cells) if c]
+                        if len(populated) < 2:
                             continue
-                        col_label = header[ci] if ci < len(header) else None
+                        row_label = populated[0][1][0]
+                        value_cells = populated[1:]
+                    else:
+                        if not single_col and _looks_like_header_row(row_cells):
+                            header = [c[0] if c else None for c in row_cells]
+                            continue
+                        value_cells = [(ci, c) for ci, c in enumerate(row_cells) if c]
+
+                    row_node = Node(next_id(), "pdf", "table_row", None,
+                                     f"page[{pi}].table[{ti}].row[{ri}]", None)
+                    t_node.children.append(row_node)
+                    for ci, (text, offsets, bbox) in value_cells:
+                        col_label = row_label if two_col else (header[ci] if header and ci < len(header) else None)
                         row_node.children.append(Node(
                             next_id(), "pdf", "table_cell", col_label,
                             f"page[{pi}].table[{ti}].row[{ri}].cell[{ci}]", text,
                             source_ref={"page": pi},
-                            meta={"atomic": True, "word_offsets": offsets, "bbox": cell_bbox}))
+                            meta={"atomic": True, "word_offsets": offsets, "bbox": bbox}))
 
     return root, path
 
@@ -478,14 +563,34 @@ def write_pdf(root, input_path, output_path):
             hit_words = [w for (w, ws, we) in offsets if we > start and ws < end]
             if not hit_words:
                 continue
-            bbox = (
+            full_bbox = (
                 min(w["x0"] for w in hit_words),
                 min(w["top"] for w in hit_words),
                 max(w["x1"] for w in hit_words),
                 max(w["bottom"] for w in hit_words),
             )
-            rect = fitz.Rect(bbox)
-            page.add_redact_annot(rect, text=repl, fill=(1, 1, 1), fontsize=8)
+            sizes = [w["size"] for w in hit_words if w.get("size")]
+            fontsize = (sum(sizes) / len(sizes)) if sizes else 8
+
+            # a value that wraps across multiple display lines (e.g. a long
+            # name split "Dinesh Hirachand" / "Munot") produces one tall
+            # merged bbox — inserting a single-line replacement into that
+            # full height makes PyMuPDF stretch the text to fill it. Blank
+            # out the whole area, but insert the (usually shorter) fake
+            # value sized to just the first line.
+            first_line_top = min(w["top"] for w in hit_words)
+            first_line_words = [w for w in hit_words if abs(w["top"] - first_line_top) < 1]
+            first_line_bbox = (
+                min(w["x0"] for w in first_line_words),
+                min(w["top"] for w in first_line_words),
+                max(w["x1"] for w in first_line_words),
+                max(w["bottom"] for w in first_line_words),
+            )
+            if len(first_line_words) < len(hit_words):
+                page.add_redact_annot(fitz.Rect(full_bbox), fill=(1, 1, 1))
+                page.add_redact_annot(fitz.Rect(first_line_bbox), text=repl, fill=(1, 1, 1), fontsize=fontsize)
+            else:
+                page.add_redact_annot(fitz.Rect(full_bbox), text=repl, fill=(1, 1, 1), fontsize=fontsize)
     for page in fitz_doc:
         page.apply_redactions()
     fitz_doc.save(output_path)
